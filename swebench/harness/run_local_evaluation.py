@@ -1,48 +1,57 @@
 from __future__ import annotations
 
+import json
 import platform
-import shlex
+import shutil
 import subprocess
 import sys
-from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-from pathlib import Path
+import threading
+import time
+import traceback
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+from pathlib import Path, PurePosixPath
 
 if platform.system() == "Linux":
     import resource
 
-import docker
+import shlex
 
 from swebench.harness.constants import (
+    APPLY_PATCH_FAIL,
+    APPLY_PATCH_PASS,
+    DOCKER_PATCH,
+    DOCKER_WORKDIR,
     KEY_INSTANCE_ID,
     KEY_MODEL,
     KEY_PREDICTION,
+    LOG_INSTANCE,
     LOG_REPORT,
+    LOG_TEST_OUTPUT,
     RUN_EVALUATION_LOG_DIR,
-)
-from swebench.harness.docker_utils import (
-    clean_images,
-    list_images,
-    should_remove,
+    UTF8,
 )
 from swebench.harness.docker_build import (
-    build_env_images,
+    BuildImageError,
+    close_logger,
+    setup_logger,
 )
+from swebench.harness.eval import get_log_dir
+from swebench.harness.grading import get_eval_report
 from swebench.harness.reporting import make_run_report
-from swebench.harness.eval import run_instance
 from swebench.harness.modal_eval import (
     run_instances_modal,
     validate_modal_credentials,
 )
-
 from swebench.harness.tracto_eval import (
     get_tracto_eval_run_dir,
     run_instances_tracto,
     validate_tracto_env_vars,
 )
-from swebench.harness.test_spec.test_spec import make_test_spec
+from swebench.harness.test_spec.test_spec import TestSpec, make_test_spec
 from swebench.harness.utils import (
-    load_swebench_dataset,
+    EvaluationError,
     get_predictions_from_file,
+    load_swebench_dataset,
     run_threadpool,
     str2bool,
 )
@@ -52,6 +61,67 @@ GIT_APPLY_CMDS = [
     "git apply --verbose --reject",
     "patch --batch --fuzz=5 -p1 -i",
 ]
+
+
+def _coerce_json_object_field(
+    value: object,
+    *,
+    field_name: str,
+    instance_id: str,
+) -> dict | None:
+    """Parse JSON string fields (e.g. NeMo-Gym ``swe_rebench.jsonl``) into dicts for ``make_test_spec``."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Invalid JSON for {field_name!r} on instance {instance_id!r}: {e}"
+            ) from e
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"Expected JSON object for {field_name!r} on instance {instance_id!r}, "
+                f"got {type(parsed).__name__}"
+            )
+        return parsed
+    raise TypeError(
+        f"Expected dict or JSON str for {field_name!r} on instance {instance_id!r}, "
+        f"got {type(value).__name__}"
+    )
+
+
+def _normalize_dataset_instance_row(instance: object) -> object:
+    """Copy a dataset row and decode string ``install_config`` / ``meta`` when present."""
+    if not isinstance(instance, dict):
+        return instance
+    iid = str(instance.get(KEY_INSTANCE_ID, "<unknown>"))
+    out = dict(instance)
+    if "install_config" in out:
+        ic = out["install_config"]
+        if isinstance(ic, str):
+            parsed = _coerce_json_object_field(
+                ic, field_name="install_config", instance_id=iid
+            )
+            if parsed is None:
+                del out["install_config"]
+            else:
+                out["install_config"] = parsed
+    if "meta" in out:
+        m = out["meta"]
+        if isinstance(m, str):
+            parsed = _coerce_json_object_field(m, field_name="meta", instance_id=iid)
+            if parsed is None:
+                del out["meta"]
+            else:
+                out["meta"] = parsed
+    return out
+
 
 # Flags consumed by the host-side Apptainer wrapper (not forwarded to the inner harness).
 _APPTAINER_ONE_ARG = frozenset(
@@ -139,6 +209,233 @@ def _reexec_under_apptainer(
     return int(subprocess.call(cmd))
 
 
+def exec_run_with_timeout(cmd: str, timeout: int | None = 60) -> tuple[str, bool, float]:
+    """Run a shell command locally with a timeout (no Docker)."""
+    exec_result = b""
+    process: subprocess.Popen | None = None
+    exception: BaseException | None = None
+    timed_out = False
+
+    def run_command() -> None:
+        nonlocal exec_result, process, exception
+        try:
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=False,
+            )
+            exec_result, _ = process.communicate()
+        except Exception as e:
+            exception = e
+
+    thread = threading.Thread(target=run_command)
+    start_time = time.time()
+    thread.start()
+    thread.join(timeout if timeout is not None else 60**4)
+
+    if exception:
+        raise exception
+
+    if thread.is_alive():
+        if process is not None:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        timed_out = True
+    end_time = time.time()
+    return exec_result.decode(errors="replace"), timed_out, end_time - start_time
+
+
+def run_instance(
+    test_spec: TestSpec,
+    pred: dict,
+    rm_image: bool,
+    force_rebuild: bool,
+    client: object,
+    run_id: str,
+    timeout: int | None = None,
+    rewrite_reports: bool = False,
+) -> dict:
+    """
+    Run a single instance on the current machine (e.g. already inside Apptainer).
+
+    Same pattern as
+    https://github.com/Kipok/SWE-bench/blob/main/swebench/harness/run_local_evaluation.py
+    — subprocess + ``DOCKER_WORKDIR`` / ``DOCKER_PATCH``, no ``docker run`` / no container API.
+    ``client`` is ignored (kept for call compatibility with the old threadpool payloads).
+    """
+    del rm_image, force_rebuild, client
+
+    instance_id = test_spec.instance_id
+    log_dir = get_log_dir(pred, run_id, instance_id)
+
+    report_path = log_dir / LOG_REPORT
+    if rewrite_reports:
+        test_output_path = log_dir / LOG_TEST_OUTPUT
+        if not test_output_path.exists():
+            raise ValueError(f"Test output file {test_output_path} does not exist")
+        report = get_eval_report(
+            test_spec=test_spec,
+            prediction=pred,
+            test_log_path=test_output_path,
+            include_tests_status=True,
+        )
+        with open(report_path, "w") as f:
+            f.write(json.dumps(report, indent=4))
+        return {
+            "completed": True,
+            "resolved": report[instance_id]["resolved"],
+        }
+    if report_path.exists():
+        report = json.loads(report_path.read_text())
+        return {
+            "completed": True,
+            "resolved": report[instance_id]["resolved"],
+        }
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / LOG_INSTANCE
+    logger = setup_logger(instance_id, log_file)
+
+    eval_completed = False
+    report: dict = {}
+    try:
+        patch_file = Path(log_dir / "patch.diff")
+        patch_file.write_text(pred[KEY_PREDICTION] or "")
+        logger.info(
+            f"Intermediate patch for {instance_id} written to {patch_file}..."
+        )
+        shutil.copy2(patch_file, PurePosixPath(DOCKER_PATCH))
+
+        applied_patch = False
+        for git_apply_cmd in GIT_APPLY_CMDS:
+            val = subprocess.run(
+                f"{git_apply_cmd} {DOCKER_PATCH}",
+                cwd=DOCKER_WORKDIR,
+                shell=True,
+                capture_output=True,
+            )
+            if val.returncode == 0:
+                check_orig = subprocess.run(
+                    f"find {DOCKER_WORKDIR} -name '*.orig' -type f | head -1",
+                    cwd=DOCKER_WORKDIR,
+                    shell=True,
+                    capture_output=True,
+                )
+                if check_orig.stdout.decode(UTF8).strip():
+                    restore_val = subprocess.run(
+                        f"find {DOCKER_WORKDIR} -name '*.orig' -exec sh -c 'mv \"$1\" \"${{1%.orig}}\"' _ {{}} \\;",
+                        cwd=DOCKER_WORKDIR,
+                        shell=True,
+                        capture_output=True,
+                    )
+                    if restore_val.returncode == 0:
+                        logger.info(
+                            "Detected reverse patch, restored files from .orig and treating as already applied"
+                        )
+                        logger.info(f"{APPLY_PATCH_PASS}:\n{val.stdout.decode(UTF8)}")
+                        applied_patch = True
+                        break
+                else:
+                    logger.info(f"{APPLY_PATCH_PASS}:\n{val.stdout.decode(UTF8)}")
+                    applied_patch = True
+                    break
+            else:
+                logger.info(f"Failed to apply patch to container: {git_apply_cmd}")
+        if not applied_patch:
+            err_out = (val.stderr or val.stdout or b"").decode(UTF8)
+            logger.info(f"{APPLY_PATCH_FAIL}:\n{err_out}")
+            raise EvaluationError(
+                instance_id,
+                f"{APPLY_PATCH_FAIL}:\n{err_out}",
+                logger,
+            )
+
+        git_diff_output_before = (
+            subprocess.run(
+                "git -c core.fileMode=false diff",
+                cwd=DOCKER_WORKDIR,
+                shell=True,
+                capture_output=True,
+            )
+            .stdout.decode(UTF8)
+            .strip()
+        )
+        logger.info(f"Git diff before:\n{git_diff_output_before}")
+
+        eval_file = Path(log_dir / "eval.sh")
+        eval_file.write_text(test_spec.eval_script)
+        logger.info(f"Eval script for {instance_id} written to {eval_file}...")
+        shutil.copy2(eval_file, PurePosixPath("/eval.sh"))
+
+        test_output, timed_out, total_runtime = exec_run_with_timeout(
+            "/bin/bash /eval.sh", timeout
+        )
+        test_output_path = log_dir / LOG_TEST_OUTPUT
+        logger.info(f"Test runtime: {total_runtime:_.2f} seconds")
+        with open(test_output_path, "w") as f:
+            f.write(test_output)
+            logger.info(f"Test output for {instance_id} written to {test_output_path}")
+            if timed_out:
+                f.write(f"\n\nTimeout error: {timeout} seconds exceeded.")
+                raise EvaluationError(
+                    instance_id,
+                    f"Test timed out after {timeout} seconds.",
+                    logger,
+                )
+
+        git_diff_output_after = (
+            subprocess.run(
+                "git -c core.fileMode=false diff",
+                cwd=DOCKER_WORKDIR,
+                shell=True,
+                capture_output=True,
+            )
+            .stdout.decode(UTF8)
+            .strip()
+        )
+        logger.info(f"Git diff after:\n{git_diff_output_after}")
+        if git_diff_output_after != git_diff_output_before:
+            logger.info("Git diff changed after running eval script")
+
+        logger.info(f"Grading answer for {instance_id}...")
+        report = get_eval_report(
+            test_spec=test_spec,
+            prediction=pred,
+            test_log_path=test_output_path,
+            include_tests_status=True,
+        )
+        logger.info(
+            f"report: {report}\n"
+            f"Result for {instance_id}: resolved: {report[instance_id]['resolved']}"
+        )
+
+        with open(report_path, "w") as f:
+            f.write(json.dumps(report, indent=4))
+        eval_completed = True
+    except (EvaluationError, BuildImageError) as e:
+        logger.info(traceback.format_exc())
+        print(e)
+    except Exception as e:
+        error_msg = (
+            f"Error in evaluating model for {instance_id}: {e}\n"
+            f"{traceback.format_exc()}\n"
+            f"Check ({logger.log_file}) for more information."
+        )
+        logger.error(error_msg)
+    finally:
+        close_logger(logger)
+    return {
+        "completed": eval_completed,
+        "resolved": report.get(instance_id, {}).get("resolved", False),
+    }
+
+
 def run_instances(
     predictions: dict,
     instances: list,
@@ -148,68 +445,47 @@ def run_instances(
     max_workers: int,
     run_id: str,
     timeout: int,
-    namespace: str = "swebench",
+    namespace: str | None = "swebench",
     instance_image_tag: str = "latest",
     rewrite_reports: bool = False,
 ):
     """
-    Run all instances for the given predictions in parallel.
+    Run all instances for the given predictions in parallel (no Docker on host).
 
-    Args:
-        predictions (dict): Predictions dict generated by the model
-        instances (list): List of instances
-        cache_level (str): Cache level
-        clean (bool): Clean images above cache level
-        force_rebuild (bool): Force rebuild images
-        max_workers (int): Maximum number of workers
-        run_id (str): Run ID
-        timeout (int): Timeout for running tests
+    ``cache_level``, ``clean``, and image tags are accepted for CLI compatibility; local
+    evaluation assumes the environment is already the target image (e.g. Apptainer).
+
+    Rows from JSONL exports (e.g. ``swe_rebench.jsonl``) may store ``install_config`` and
+    ``meta`` as JSON strings; they are parsed to dicts before ``make_test_spec``.
     """
-    client = docker.from_env(timeout=600)
+    del cache_level, clean
+    normalized = [_normalize_dataset_instance_row(i) for i in instances]
     test_specs = list(
         map(
             lambda instance: make_test_spec(
-                instance, namespace=namespace, instance_image_tag=instance_image_tag
+                instance,
+                namespace=namespace,
+                instance_image_tag=instance_image_tag,
             ),
-            instances,
+            normalized,
         )
     )
 
-    # print number of existing instance images
-    instance_image_ids = {x.instance_image_key for x in test_specs}
-    existing_images = {
-        tag
-        for i in client.images.list(all=True)
-        for tag in i.tags
-        if tag in instance_image_ids
-    }
-    if not force_rebuild and len(existing_images):
-        print(
-            f"Found {len(existing_images)} existing instance images. Will reuse them."
-        )
-
-    # run instances in parallel
     payloads = []
     for test_spec in test_specs:
         payloads.append(
             (
                 test_spec,
                 predictions[test_spec.instance_id],
-                should_remove(
-                    test_spec.instance_image_key,
-                    cache_level,
-                    clean,
-                    existing_images,
-                ),
+                False,
                 force_rebuild,
-                client,
+                None,
                 run_id,
                 timeout,
                 rewrite_reports,
             )
         )
 
-    # run instances in parallel
     print(f"Running {len(instances)} instances...")
     run_threadpool(run_instance, payloads, max_workers)
     print("All instances run.")
@@ -398,18 +674,13 @@ def main(
             )
         return
 
-    # run instances locally
+    # Local: no Docker — assume already in instance env (e.g. Apptainer .sif).
     if platform.system() == "Linux":
         resource.setrlimit(resource.RLIMIT_NOFILE, (open_file_limit, open_file_limit))
-    client = docker.from_env(timeout=600)
 
-    existing_images = list_images(client)
     if not dataset:
         print("No instances to run.")
     else:
-        # build environment images + run instances
-        if namespace is None and not rewrite_reports:
-            build_env_images(client, dataset, force_rebuild, max_workers)
         run_instances(
             predictions,
             dataset,
@@ -424,9 +695,7 @@ def main(
             rewrite_reports=rewrite_reports,
         )
 
-    # clean images + make final report
-    clean_images(client, existing_images, cache_level, clean)
-    return make_run_report(predictions, full_dataset, run_id, client)
+    return make_run_report(predictions, full_dataset, run_id, None)
 
 
 if __name__ == "__main__":
