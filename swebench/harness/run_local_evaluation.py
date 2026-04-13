@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -135,6 +136,27 @@ _APPTAINER_ONE_ARG = frozenset(
 _APPTAINER_TOGGLE = frozenset({"--apptainer-nv"})
 
 
+def _resolve_apptainer_exec(cmd: str) -> str:
+    """Resolve ``apptainer`` / ``singularity`` to an absolute path for ``subprocess`` (non-login PATH)."""
+    c = (cmd or "apptainer").strip() or "apptainer"
+    if os.path.isabs(c):
+        p = Path(c)
+        if p.is_file():
+            return str(p.resolve())
+        raise FileNotFoundError(f"Apptainer executable not found: {c}")
+    resolved = shutil.which(c)
+    if resolved:
+        return resolved
+    if c == "singularity":
+        fallback = shutil.which("apptainer")
+        if fallback:
+            return fallback
+    raise FileNotFoundError(
+        f"Container executable not found: {c!r} (not on PATH). "
+        "Install Apptainer, export PATH (e.g. /usr/bin), or pass --apptainer-exec /full/path/to/apptainer"
+    )
+
+
 def _strip_apptainer_flags_from_argv(argv: list[str]) -> list[str]:
     """Return argv with Apptainer-only options removed (for inner ``python -m ...``)."""
     out: list[str] = []
@@ -178,16 +200,18 @@ def _reexec_under_apptainer(
     (e.g. ``/nemo_run/code:/nemo_run/code``, ``/root:/root_mount,ro``, predictions dirs).
     """
     forward = _strip_apptainer_flags_from_argv(sys.argv[1:])
+
     inner_parts = [
-        apptainer_python,
+        '/root/SWE-bench/venv/bin/python',
         "-m",
         "swebench.harness.run_local_evaluation",
         *forward,
     ]
     inner = " ".join(shlex.quote(p) for p in inner_parts)
 
+    exe = _resolve_apptainer_exec(apptainer_exec)
     cmd: list[str] = [
-        apptainer_exec,
+        exe,
         "exec",
         "--writable-tmpfs",
         "--cleanenv",
@@ -707,7 +731,7 @@ if __name__ == "__main__":
     # Common args
     parser.add_argument(
         "--dataset_name",
-        default="SWE-bench/SWE-bench_Lite",
+        default="nebius/SWE-rebench",
         type=str,
         help="Name of dataset or path to JSON file.",
     )
@@ -809,8 +833,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--apptainer-python",
         type=str,
-        default="/root/SWE-bench/venv/bin/python",
-        help="Python inside the container used for ``-m swebench.harness.run_local_evaluation``.",
+        default="/usr/bin/python3",
+        help=(
+            "Python *inside the .sif* for re-exec (not the host venv). "
+            "SWE-rebench instance images typically use ``/usr/bin/python3``; "
+            "classic SWE Docker-style images may need ``/root/SWE-bench/venv/bin/python``."
+        ),
     )
     parser.add_argument(
         "--apptainer-bind",
